@@ -1,3 +1,4 @@
+import CoreImage.CIFilterBuiltins
 import MapKit
 import SwiftUI
 
@@ -532,6 +533,28 @@ private struct StepControls: View {
             }
             Toggle("藍牙同步至 iPhone", isOn: Binding(get: { broadcaster.enabled }, set: broadcaster.setEnabled))
                 .toggleStyle(.switch)
+            if let pairing = broadcaster.pairing {
+                DisclosureGroup("顯示 iPhone 配對碼") {
+                    StepPairingCode(pairing: pairing).equatable()
+                }
+            }
+            Button(action: broadcaster.enqueueTestSteps) {
+                Label("傳送 \(StepBroadcaster.testStepCount.formatted()) 測試步", systemImage: "paperplane")
+            }
+            .buttonStyle(ControlButton())
+            .accessibilityIdentifier("send-test-steps")
+            if let testStepStatus = broadcaster.testStepStatus {
+                switch testStepStatus {
+                case .queued:
+                    Text("測試步數等待 iPhone 確認")
+                        .font(.caption)
+                        .foregroundStyle(secondary)
+                case .acknowledged:
+                    Label("iPhone 已確認寫入測試步數", systemImage: "checkmark.circle")
+                        .font(.caption)
+                        .foregroundStyle(accent)
+                }
+            }
             if broadcaster.pendingSteps > 0 {
                 Text("待同步 \(broadcaster.pendingSteps) 步")
                     .font(.caption)
@@ -539,10 +562,44 @@ private struct StepControls: View {
             }
             if let error = broadcaster.storageError {
                 Text(error).font(.caption).foregroundStyle(warning)
-            } else if broadcaster.enabled {
+            } else if broadcaster.status != "藍牙同步已關閉" {
                 Text(broadcaster.status).font(.caption).foregroundStyle(secondary)
             }
         }
+    }
+}
+
+private struct StepPairingCode: View, Equatable {
+    let pairing: StepPairing
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("在 iPhone 的「GPS 搖桿步數」按「掃描 Mac 配對碼」。")
+                .font(.caption)
+            if let qrImage {
+                Image(decorative: qrImage, scale: 1)
+                    .interpolation(.none)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 180, height: 180)
+                    .padding(12)
+                    .background(.white)
+                    .accessibilityLabel("iPhone 步數配對 QR 碼")
+            }
+            Button("複製配對碼") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(pairing.code, forType: .string)
+            }
+            .buttonStyle(ControlButton())
+        }
+        .padding(.vertical, 8)
+    }
+
+    private var qrImage: CGImage? {
+        let filter = CIFilter.qrCodeGenerator()
+        filter.message = Data(pairing.qrValue.utf8)
+        guard let output = filter.outputImage else { return nil }
+        return CIContext().createCGImage(output, from: output.extent)
     }
 }
 

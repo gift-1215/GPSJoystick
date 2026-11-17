@@ -4,21 +4,38 @@ import Foundation
 
 @MainActor
 final class StepBroadcaster: NSObject, ObservableObject, @preconcurrency CBPeripheralManagerDelegate {
+    enum TestStepStatus: Equatable {
+        case queued(UUID)
+        case acknowledged
+    }
+
+    static let testStepCount = 2_000
+
     @Published private(set) var enabled = false
     @Published private(set) var status = "藍牙同步已關閉"
     @Published private(set) var pendingSteps = 0
     @Published private(set) var storageError: String?
+    @Published private(set) var pairing: StepPairing?
+    @Published private(set) var testStepStatus: TestStepStatus?
 
     private let file = URL.applicationSupportDirectory
         .appending(path: "GPSJoystick/step-outbox.json")
+    private let pairingFile = URL.applicationSupportDirectory
+        .appending(path: "GPSJoystick/step-pairing-key")
     private var outbox: StepOutbox?
     private var unsaved: [StepBatch] = []
     private var manager: CBPeripheralManager?
     private var characteristic: CBMutableCharacteristic?
     private var availability: CBMutableCharacteristic?
     private var notificationPending = false
-    private var reads: [UUID: Data] = [:]
-    private let serviceID = CBUUID(string: StepBluetooth.serviceID)
+    private var notificationSequence: UInt32 = 0
+    private var notificationRetry: Task<Void, Never>?
+    private var subscribers: [UUID: CBCentral] = [:]
+    private struct BatchRead {
+        let data: Data
+        let batch: StepBatch?
+    }
+    private var reads: [UUID: BatchRead] = [:]
     private let batchID = CBUUID(string: StepBluetooth.batchID)
     private let acknowledgementID = CBUUID(string: StepBluetooth.acknowledgementID)
     private let availableID = CBUUID(string: StepBluetooth.availableID)
@@ -32,6 +49,13 @@ final class StepBroadcaster: NSObject, ObservableObject, @preconcurrency CBPerip
         unsaved.append(batch)
         persist()
         notifyAvailability()
+    }
+
+    func enqueueTestSteps() {
+        let now = Date()
+        let batch = StepBatch(id: UUID(), start: now.addingTimeInterval(-1), end: now, count: Self.testStepCount)
+        testStepStatus = .queued(batch.id)
+        enqueue(batch)
     }
 
     func persist() {
@@ -55,6 +79,13 @@ final class StepBroadcaster: NSObject, ObservableObject, @preconcurrency CBPerip
         enabled = value
         if value {
             persist()
+            do {
+                pairing = try loadPairing()
+            } catch {
+                enabled = false
+                status = "無法讀取或儲存步數配對碼。"
+                return
+            }
             status = "正在啟動藍牙…"
             manager = CBPeripheralManager(delegate: self, queue: nil, options: [
                 CBPeripheralManagerOptionShowPowerAlertKey: false
@@ -65,8 +96,10 @@ final class StepBroadcaster: NSObject, ObservableObject, @preconcurrency CBPerip
             manager = nil
             characteristic = nil
             availability = nil
-            notificationPending = false
+            subscribers.removeAll()
+            cancelNotificationRetry()
             reads.removeAll()
+            pairing = nil
             status = "藍牙同步已關閉"
         }
     }
@@ -75,22 +108,24 @@ final class StepBroadcaster: NSObject, ObservableObject, @preconcurrency CBPerip
         guard peripheral === manager else { return }
         characteristic = nil
         availability = nil
-        notificationPending = false
+        subscribers.removeAll()
+        cancelNotificationRetry()
         reads.removeAll()
         switch peripheral.state {
         case .poweredOn:
+            guard let pairing else { return }
             let batch = CBMutableCharacteristic(
                 type: batchID, properties: .read, value: nil,
-                permissions: [.readable, .readEncryptionRequired]
+                permissions: .readable
             )
             let ack = CBMutableCharacteristic(
                 type: acknowledgementID, properties: .write, value: nil,
-                permissions: [.writeable, .writeEncryptionRequired]
+                permissions: .writeable
             )
             let available = CBMutableCharacteristic(
-                type: availableID, properties: [.indicate, .indicateEncryptionRequired], value: nil, permissions: []
+                type: availableID, properties: .indicate, value: nil, permissions: []
             )
-            let service = CBMutableService(type: serviceID, primary: true)
+            let service = CBMutableService(type: CBUUID(nsuuid: pairing.serviceID), primary: true)
             service.characteristics = [batch, ack, available]
             characteristic = batch
             availability = available
@@ -113,8 +148,7 @@ final class StepBroadcaster: NSObject, ObservableObject, @preconcurrency CBPerip
             return
         }
         peripheral.startAdvertising([
-            CBAdvertisementDataServiceUUIDsKey: [serviceID],
-            CBAdvertisementDataLocalNameKey: "GPSJoystick"
+            CBAdvertisementDataServiceUUIDsKey: [service.uuid]
         ])
     }
 
@@ -124,25 +158,26 @@ final class StepBroadcaster: NSObject, ObservableObject, @preconcurrency CBPerip
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
-        guard peripheral === manager, request.characteristic.uuid == characteristic?.uuid else {
+        guard peripheral === manager, request.characteristic.uuid == characteristic?.uuid, let pairing else {
             peripheral.respond(to: request, withResult: .requestNotSupported)
             return
         }
         let central = request.central.identifier
         if request.offset == 0 {
-            if let batch = outbox?.batches.first {
-                reads[central] = try? JSONEncoder().encode(batch.adjustedForClockGap)
-            } else {
-                reads[central] = Data()
+            let batch = outbox?.batches.first?.adjustedForClockGap
+            guard let data = try? pairing.seal(batch) else {
+                peripheral.respond(to: request, withResult: .unlikelyError)
+                return
             }
+            reads[central] = BatchRead(data: data, batch: batch)
         }
-        guard let data = reads[central], request.offset <= data.count else {
+        guard let read = reads[central], request.offset <= read.data.count else {
             peripheral.respond(to: request, withResult: .invalidOffset)
             return
         }
-        request.value = Data(data.dropFirst(request.offset))
+        request.value = Data(read.data.dropFirst(request.offset))
         peripheral.respond(to: request, withResult: .success)
-        status = data.isEmpty ? "iPhone 已連線，等待模擬步數" : "iPhone 已讀取步數，等待寫入確認"
+        status = read.batch == nil ? "iPhone 已連線，等待模擬步數" : "iPhone 已讀取步數，等待寫入確認"
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
@@ -152,13 +187,20 @@ final class StepBroadcaster: NSObject, ObservableObject, @preconcurrency CBPerip
             peripheral.respond(to: request, withResult: .requestNotSupported)
             return
         }
+        guard let pairing, let read = reads[request.central.identifier], let batch = read.batch,
+              pairing.verifies(data, for: read.data) else {
+            peripheral.respond(to: request, withResult: .insufficientAuthorization)
+            return
+        }
         do {
-            guard try outbox?.acknowledge(data) == true else {
-                peripheral.respond(to: request, withResult: .unlikelyError)
-                return
-            }
-            reads.removeValue(forKey: request.central.identifier)
+            try outbox?.acknowledge(batch.id)
             updatePendingSteps()
+            if testStepStatus == .queued(batch.id) {
+                testStepStatus = .acknowledged
+            }
+            if outbox?.batches.isEmpty == true {
+                cancelNotificationRetry()
+            }
             status = "iPhone 已確認寫入步數"
             peripheral.respond(to: request, withResult: .success)
         } catch {
@@ -169,14 +211,17 @@ final class StepBroadcaster: NSObject, ObservableObject, @preconcurrency CBPerip
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic) {
         guard peripheral === manager, characteristic.uuid == availableID else { return }
+        subscribers[central.identifier] = central
         status = "iPhone 已連線"
         notifyAvailability()
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic) {
         guard peripheral === manager, characteristic.uuid == availableID else { return }
+        subscribers.removeValue(forKey: central.identifier)
         reads.removeValue(forKey: central.identifier)
-        if availability?.subscribedCentrals?.isEmpty != false {
+        if subscribers.isEmpty {
+            cancelNotificationRetry()
             status = "等待 iPhone 配套 App 接收"
         }
     }
@@ -187,16 +232,54 @@ final class StepBroadcaster: NSObject, ObservableObject, @preconcurrency CBPerip
     }
 
     private func notifyAvailability() {
-        guard let manager, let availability, availability.subscribedCentrals?.isEmpty == false,
+        guard let manager, manager.state == .poweredOn, let availability, !subscribers.isEmpty,
               outbox?.batches.isEmpty == false else {
-            notificationPending = false
+            cancelNotificationRetry()
             return
         }
-        notificationPending = !manager.updateValue(Data([1]), for: availability, onSubscribedCentrals: nil)
+        notificationSequence &+= 1
+        let signal = withUnsafeBytes(of: notificationSequence.bigEndian) { Data($0) }
+        notificationPending = !manager.updateValue(signal, for: availability, onSubscribedCentrals: Array(subscribers.values))
+        if notificationRetry == nil {
+            // Retry if the phone missed the wake-up and no receipt cleared the queue.
+            notificationRetry = Task { [weak self] in
+                do {
+                    try await Task.sleep(for: .seconds(3))
+                } catch {
+                    return
+                }
+                guard let self, !Task.isCancelled else { return }
+                self.notificationRetry = nil
+                self.notifyAvailability()
+            }
+        }
+    }
+
+    private func cancelNotificationRetry() {
+        notificationPending = false
+        notificationRetry?.cancel()
+        notificationRetry = nil
     }
 
     private func updatePendingSteps() {
         pendingSteps = (outbox?.batches.reduce(0) { $0 + $1.count } ?? 0)
             + unsaved.reduce(0) { $0 + $1.count }
+    }
+
+    private func loadPairing() throws -> StepPairing {
+        do {
+            let secret = try Data(contentsOf: pairingFile)
+            guard let pairing = StepPairing(secret: secret) else { throw CocoaError(.fileReadCorruptFile) }
+            return pairing
+        } catch CocoaError.fileReadNoSuchFile {
+            let pairing = StepPairing()
+            let files = FileManager.default
+            try files.createDirectory(at: pairingFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+            guard files.createFile(atPath: pairingFile.path, contents: pairing.secret,
+                                   attributes: [.posixPermissions: 0o600]) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+            return pairing
+        }
     }
 }

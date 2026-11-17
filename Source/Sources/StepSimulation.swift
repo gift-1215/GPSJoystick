@@ -1,6 +1,7 @@
 import Foundation
 
 struct StepSimulation {
+    private static let batchInterval: TimeInterval = 2
     private(set) var total = 0
     private var remainder = 0.0
     private var start: Date?
@@ -24,7 +25,7 @@ struct StepSimulation {
         steps += added
         total += added
 
-        return duration >= StepBatch.interval ? finish() : completed
+        return duration >= Self.batchInterval ? finish() : completed
     }
 
     mutating func finish() -> StepBatch? {

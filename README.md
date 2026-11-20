@@ -4,7 +4,7 @@ Mac 上的 iPhone 定位測試原型。用滑鼠拖曳畫面搖桿或按鍵盤�
 
 ## 先在 Mac 上試用
 
-1. 解壓縮後開啟 `GPSJoystick.app`。這個套件內的 App 為 Apple 晶片版，最低部署版本為 macOS 14。
+1. 解壓縮後開啟 `GPSJoystick.app`。最低部署版本為 macOS 14。注意：套件內附的預先編譯 App 僅含 Apple 晶片（arm64）版本；Intel Mac（例如 Core i7）請先依下方「原始碼」一節重新編譯成 Universal 版本再使用。
 2. 預設從台北 101 開始。按「選擇起點」再點地圖，可跳到新的起點。用加減按鈕縮放，用「回到模擬位置」將地圖置中。
 3. 拖曳搖桿或按方向鍵，即可朝該方向以設定速度移動。放開後會繼續前進。按搖桿右側的「暫停」可停在目前位置，再按「開始」繼續。選擇新起點時也會暫停移動。
 4. 速度滑桿可設定移動速度（0–120 km/h）。步行、單車和開車分別為 5、18 和 50 km/h。
@@ -37,6 +37,12 @@ Mac 上的 iPhone 定位測試原型。用滑鼠拖曳畫面搖桿或按鍵盤�
 
 ```sh
 ./Source/build.sh "$PWD/GPSJoystick-Local.app"
+```
+
+預設會編譯 Universal 版本（arm64 + x86_64），可同時在 Apple 晶片與 Intel Mac（例如 Core i7，需 macOS 14 以上）執行。只需要 Intel 版本時可指定架構：
+
+```sh
+GPS_JOYSTICK_ARCHS="x86_64" ./Source/build.sh "$PWD/GPSJoystick-Local.app"
 ```
 
 - [Apple 的 iPhone 開發者模式說明](https://developer.apple.com/documentation/xcode/enabling-developer-mode-on-a-device)

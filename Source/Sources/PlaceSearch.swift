@@ -89,6 +89,8 @@ final class PlaceSearch: NSObject, ObservableObject, @preconcurrency MKLocalSear
                 self.places = response.mapItems.compactMap { item in
                     let point: GeoPoint
                     let address: String
+                    // Swift 6.2（Xcode 26）以上才有 macOS 26 的新 API；舊版工具（例如 Intel Mac 上的 macOS 14/15）走舊寫法。
+                    #if compiler(>=6.2)
                     if #available(macOS 26, *) {
                         point = GeoPoint(item.location.coordinate)
                         address = item.address?.fullAddress ?? ""
@@ -96,6 +98,10 @@ final class PlaceSearch: NSObject, ObservableObject, @preconcurrency MKLocalSear
                         point = GeoPoint(item.placemark.coordinate)
                         address = item.placemark.title ?? ""
                     }
+                    #else
+                    point = GeoPoint(item.placemark.coordinate)
+                    address = item.placemark.title ?? ""
+                    #endif
                     guard point.isValid else { return nil }
                     return SearchPlace(
                         name: item.name ?? (address.isEmpty ? "地圖位置" : address),
